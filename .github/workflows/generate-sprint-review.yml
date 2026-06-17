@@ -1,0 +1,33 @@
+name: Generate sprint review
+
+on:
+  workflow_dispatch:
+    inputs:
+      sprint_name:
+        description: Optional sprint name (e.g. 2026-05-25). If empty, latest closed sprint is used.
+        required: false
+        type: string
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Generate sprint review page
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_PROJECT_KEY: ${{ secrets.JIRA_PROJECT_KEY }}
+          JIRA_BOARD_ID: ${{ secrets.JIRA_BOARD_ID }}
+          CONFLUENCE_SPACE_KEY: ${{ secrets.CONFLUENCE_SPACE_KEY }}
+          CONFLUENCE_PARENT_PAGE_ID: ${{ secrets.CONFLUENCE_PARENT_PAGE_ID }}
+          SPRINT_NAME: ${{ inputs.sprint_name }}
+        run: npm run generate:sprint-review

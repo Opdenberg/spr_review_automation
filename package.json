@@ -1,0 +1,10 @@
+{
+  "name": "spr_review_automation",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Generate sprint review pages in Confluence from Jira sprint data.",
+  "type": "module",
+  "scripts": {
+    "generate:sprint-review": "node src/index.mjs"
+  }
+}
