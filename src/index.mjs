@@ -1,3 +1,5 @@
+import { readFile } from "node:fs/promises";
+
 const requiredEnv = [
   "JIRA_BASE_URL",
   "JIRA_EMAIL",
@@ -31,6 +33,8 @@ const config = {
   },
   ignoredStatuses: new Set(["On Hold"])
 };
+
+const defaultTemplateUrl = new URL("./templates/sprint-review-storage-template.html", import.meta.url);
 
 const authHeader = `Basic ${Buffer.from(`${config.email}:${config.apiToken}`).toString("base64")}`;
 
@@ -147,7 +151,7 @@ const fetchSprintIssues = async (sprintId) => {
     const page = await jiraGet(`/rest/agile/1.0/sprint/${sprintId}/issue`, {
       startAt,
       maxResults,
-      fields: "summary,description,status,issuetype"
+      fields: "summary,description,status,issuetype,labels,components"
     });
     issues.push(...(page.issues || []));
     startAt += maxResults;
@@ -182,22 +186,274 @@ const escapeHtml = (value) =>
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
 
-const buildStorageBody = (sprint, groupedIssues) => {
-  const sections = Object.entries(groupedIssues)
-    .filter(([, items]) => items.length > 0)
-    .map(([bucket, items]) => {
-      const rows = items
-        .map(
-          (item) =>
-            `<tr><td><a href="${escapeHtml(item.url)}">${escapeHtml(item.key)}</a></td><td>${escapeHtml(item.summary)}</td><td>${escapeHtml(item.status)}</td><td>${escapeHtml(item.descriptionSummary)}</td></tr>`
-        )
-        .join("");
+const formatDate = (value) => {
+  if (!value) {
+    return "";
+  }
 
-      return `<h2>${escapeHtml(bucket)} (${items.length})</h2><table><tbody><tr><th>Issue</th><th>Summary</th><th>Status</th><th>Description summary</th></tr>${rows}</tbody></table>`;
-    })
-    .join("");
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
 
-  return `<h1>Sprint Review - ${escapeHtml(sprint.name)}</h1><p>Generated automatically for project ${escapeHtml(config.projectKey)}.</p>${sections || "<p>No issues matched the configured filters.</p>"}`;
+  return date.toISOString().slice(0, 10);
+};
+
+const extractSprintNumber = (name) => {
+  const match = String(name || "").match(/(\d+)/);
+  return match ? match[1] : "";
+};
+
+const splitSprintGoals = (goalText) => {
+  if (!goalText) {
+    return [];
+  }
+
+  const lineParts = String(goalText)
+    .replace(/\r/g, "")
+    .split(/\n+/)
+    .map((part) => part.trim().replace(/^[-*•\d.)\s]+/, ""))
+    .filter(Boolean);
+
+  const parts =
+    lineParts.length > 1
+      ? lineParts
+      : lineParts
+          .flatMap((part) => part.split(/[;|]+/))
+          .map((part) => part.trim())
+          .filter(Boolean);
+
+  const unique = [];
+  for (const part of parts) {
+    if (!unique.includes(part)) {
+      unique.push(part);
+    }
+  }
+
+  return unique.slice(0, 5);
+};
+
+const stopwords = new Set([
+  "the",
+  "and",
+  "for",
+  "with",
+  "from",
+  "into",
+  "that",
+  "this",
+  "our",
+  "are",
+  "was",
+  "were",
+  "have",
+  "has",
+  "had",
+  "your",
+  "you",
+  "about",
+  "will",
+  "can",
+  "could",
+  "would",
+  "should",
+  "done",
+  "todo",
+  "to",
+  "in",
+  "on",
+  "of",
+  "a",
+  "an",
+  "is",
+  "be"
+]);
+
+const tokenize = (value) =>
+  String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, " ")
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter((token) => token && token.length > 2 && !stopwords.has(token));
+
+const issueKeywordSet = (issue) => {
+  const labels = (issue.labels || []).join(" ");
+  const components = (issue.components || []).join(" ");
+  const text = `${issue.summary} ${issue.descriptionSummary} ${labels} ${components}`;
+  return new Set(tokenize(text));
+};
+
+const scoreGoalMatch = (goal, issue) => {
+  const goalTokens = tokenize(goal);
+  if (!goalTokens.length) {
+    return 0;
+  }
+
+  const keywords = issueKeywordSet(issue);
+  let score = 0;
+  for (const token of goalTokens) {
+    if (keywords.has(token)) {
+      score += 1;
+    }
+  }
+
+  return score;
+};
+
+const mapIssuesToGoals = (goals, issues) => {
+  const matched = Array.from({ length: goals.length }, () => []);
+  const unmatched = [];
+
+  for (const issue of issues) {
+    let bestGoalIndex = -1;
+    let bestScore = 0;
+
+    for (let i = 0; i < goals.length; i += 1) {
+      const score = scoreGoalMatch(goals[i], issue);
+      if (score > bestScore) {
+        bestScore = score;
+        bestGoalIndex = i;
+      }
+    }
+
+    if (bestGoalIndex >= 0 && bestScore > 0) {
+      matched[bestGoalIndex].push(issue);
+    } else {
+      unmatched.push(issue);
+    }
+  }
+
+  return { matched, unmatched };
+};
+
+const markdownIssueLink = (issue) => `[${issue.key}](${issue.url})`;
+
+const safeText = (value) =>
+  String(value ?? "")
+    .replace(/[\r\n]+/g, " ")
+    .replace(/[<>]/g, "")
+    .trim();
+
+const inferGoalStatus = (issues) => {
+  if (!issues.length) {
+    return "";
+  }
+
+  const statuses = issues.map((issue) => normalize(issue.status));
+  if (statuses.every((status) => status === "done")) {
+    return "Done";
+  }
+
+  if (statuses.some((status) => status.includes("review") || status.includes("test"))) {
+    return "Testing";
+  }
+
+  return "In progress";
+};
+
+const issueContextLine = (issue) => {
+  const base = `${markdownIssueLink(issue)}: ${safeText(issue.summary)}`;
+  if (!issue.descriptionSummary || issue.descriptionSummary === "No description provided.") {
+    return base;
+  }
+
+  return `${base} - ${safeText(issue.descriptionSummary)}`;
+};
+
+const itemFrom = (items, index, shouldEscape = true) => {
+  if (!items[index]) {
+    return "";
+  }
+
+  return shouldEscape ? escapeHtml(items[index]) : items[index];
+};
+
+const renderTemplate = (template, values) =>
+  template.replace(/\{\{([a-z0-9_]+)\}\}/gi, (_, key) => (key in values ? String(values[key]) : ""));
+
+const loadTemplate = async () => {
+  const customTemplatePath = process.env.SPRINT_REVIEW_TEMPLATE_PATH;
+  if (customTemplatePath) {
+    return readFile(customTemplatePath, "utf8");
+  }
+
+  return readFile(defaultTemplateUrl, "utf8");
+};
+
+const buildStorageBody = (sprint, groupedIssues, template) => {
+  const allIssues = [
+    ...groupedIssues["In Progress"],
+    ...groupedIssues["In Review"],
+    ...groupedIssues["To Do"],
+    ...groupedIssues.Done,
+    ...groupedIssues.Other
+  ];
+
+  const sprintGoalText = String(sprint.goal || "").trim();
+  const parsedGoals = splitSprintGoals(sprintGoalText);
+  const { matched: goalIssueBuckets, unmatched: unmatchedGoalIssues } = mapIssuesToGoals(parsedGoals, allIssues);
+
+  const objectiveTitle = parsedGoals[0] || sprintGoalText.split(/[.!?\n]/)[0] || "";
+
+  const values = {
+    sprint_number: escapeHtml(extractSprintNumber(sprint.name) || sprint.name),
+    sprint_start_date: escapeHtml(formatDate(sprint.startDate)),
+    sprint_end_date: escapeHtml(formatDate(sprint.endDate || sprint.completeDate)),
+    objective_title: escapeHtml(objectiveTitle),
+    sprint_name: escapeHtml(sprint.name),
+    project_key: escapeHtml(config.projectKey),
+    generated_at: escapeHtml(new Date().toISOString().replace("T", " ").replace(".000Z", " UTC")),
+    done_count: groupedIssues.Done.length,
+    in_review_count: groupedIssues["In Review"].length,
+    in_progress_count: groupedIssues["In Progress"].length,
+    to_do_count: groupedIssues["To Do"].length,
+    other_count: groupedIssues.Other.length,
+    topic_1_title: "Done beyond sprint goals",
+    topic_1_item_1: itemFrom(groupedIssues.Done.map(issueContextLine), 0, false),
+    topic_1_item_2: itemFrom(groupedIssues.Done.map(issueContextLine), 1, false),
+    topic_1_item_3_optional: itemFrom(groupedIssues.Done.map(issueContextLine), 2, false),
+    topic_2_title: "In review or testing work",
+    topic_2_item_1: itemFrom(groupedIssues["In Review"].map(issueContextLine), 0, false),
+    topic_2_item_2: itemFrom(groupedIssues["In Review"].map(issueContextLine), 1, false),
+    topic_2_item_3_optional: itemFrom(groupedIssues["In Review"].map(issueContextLine), 2, false),
+    topic_3_title: "Other notable work",
+    topic_3_item_1: itemFrom(unmatchedGoalIssues.map(issueContextLine), 0, false),
+    topic_3_item_2: itemFrom(unmatchedGoalIssues.map(issueContextLine), 1, false),
+    topic_3_item_3_optional: itemFrom(unmatchedGoalIssues.map(issueContextLine), 2, false),
+    next_sprint_item_1: itemFrom([...groupedIssues["To Do"], ...groupedIssues["In Progress"]].map(issueContextLine), 0, false),
+    next_sprint_item_2: itemFrom([...groupedIssues["To Do"], ...groupedIssues["In Progress"]].map(issueContextLine), 1, false),
+    next_sprint_item_3: itemFrom([...groupedIssues["To Do"], ...groupedIssues["In Progress"]].map(issueContextLine), 2, false),
+    next_sprint_item_4: itemFrom([...groupedIssues["To Do"], ...groupedIssues["In Progress"]].map(issueContextLine), 3, false),
+    next_sprint_item_5: itemFrom([...groupedIssues["To Do"], ...groupedIssues["In Progress"]].map(issueContextLine), 4, false),
+    next_sprint_item_6: itemFrom([...groupedIssues["To Do"], ...groupedIssues["In Progress"]].map(issueContextLine), 5, false),
+    next_sprint_item_7: itemFrom([...groupedIssues["To Do"], ...groupedIssues["In Progress"]].map(issueContextLine), 6, false)
+  };
+
+  for (let i = 1; i <= 5; i += 1) {
+    const goal = parsedGoals[i - 1] || "";
+    const goalIssues = goalIssueBuckets[i - 1] || [];
+    const goalStatusItems = goalIssues.map(issueContextLine);
+
+    values[`sprint_goal_${i}`] = escapeHtml(goal);
+    values[`key_result_or_theme_${i}`] = escapeHtml(objectiveTitle);
+    values[`status_goal_${i}`] = escapeHtml(inferGoalStatus(goalIssues));
+
+    const topLinks = goalIssues.slice(0, 3).map(markdownIssueLink).join(", ");
+    const goalDescription = topLinks
+      ? `Stories linked to this goal: ${topLinks}. Context: ${goalIssues
+          .slice(0, 2)
+          .map((issue) => `${safeText(issue.summary)} (${safeText(issue.status)})`)
+          .join("; ")}`
+      : "";
+
+    values[`goal_description_${i}`] = goalDescription;
+    values[`status_item_${i}_1`] = itemFrom(goalStatusItems, 0, false);
+    values[`status_item_${i}_2`] = itemFrom(goalStatusItems, 1, false);
+    values[`status_item_${i}_3_optional`] = itemFrom(goalStatusItems, 2, false);
+  }
+
+  return renderTemplate(template, values);
 };
 
 const upsertConfluencePage = async (title, storageValue) => {
@@ -223,6 +479,7 @@ const upsertConfluencePage = async (title, storageValue) => {
     type: "page",
     title,
     space: { key: config.confluenceSpaceKey },
+    ancestors: [{ id: config.confluenceParentPageId }],
     version: { number: Number(page.version.number) + 1 },
     body: { storage: { value: storageValue, representation: "storage" } }
   });
@@ -252,12 +509,15 @@ const run = async () => {
       summary: issue.fields?.summary || "",
       status,
       descriptionSummary: summarize(issue.fields?.description),
+      labels: issue.fields?.labels || [],
+      components: (issue.fields?.components || []).map((component) => component?.name || "").filter(Boolean),
       url: `${config.jiraBaseUrl}/browse/${issue.key}`
     });
   }
 
   const title = `Sprint Review - ${sprint.name}`;
-  const body = buildStorageBody(sprint, groupedIssues);
+  const template = await loadTemplate();
+  const body = buildStorageBody(sprint, groupedIssues, template);
   const result = await upsertConfluencePage(title, body);
   const pageId = result.id || result?.results?.[0]?.id;
   const pageUrl = `${config.jiraBaseUrl}/wiki/spaces/${config.confluenceSpaceKey}/pages/${pageId}`;
