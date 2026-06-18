@@ -133,6 +133,14 @@ const resolveSprint = async () => {
     return found;
   }
 
+  // Prefer the current active sprint when no explicit sprint name is provided.
+  const active = sprints
+    .filter((s) => s.state === "active")
+    .sort((a, b) => new Date(b.startDate || 0) - new Date(a.startDate || 0));
+  if (active.length > 0) {
+    return active[0];
+  }
+
   const closed = sprints.filter((s) => s.state === "closed");
   if (closed.length === 0) {
     throw new Error("No closed sprint found and SPRINT_NAME was not provided.");
@@ -200,7 +208,7 @@ const formatDate = (value) => {
 };
 
 const extractSprintNumber = (name) => {
-  const match = String(name || "").match(/(\d+)/);
+  const match = String(name || "").match(/(?:sprint\s*#?\s*)(\d+)/i);
   return match ? match[1] : "";
 };
 
@@ -369,6 +377,25 @@ const itemFrom = (items, index, shouldEscape = true) => {
   return shouldEscape ? escapeHtml(items[index]) : items[index];
 };
 
+const fallbackGoalsFromIssues = (allIssues) => {
+  const issueBased = allIssues
+    .map((issue) => safeText(issue.summary))
+    .filter(Boolean)
+    .slice(0, 5);
+
+  if (issueBased.length > 0) {
+    return issueBased;
+  }
+
+  return [
+    "Progress sprint scope",
+    "Validate in-review work",
+    "Prepare upcoming sprint items",
+    "Close completed work",
+    "Handle additional requests"
+  ];
+};
+
 const renderTemplate = (template, values) =>
   template.replace(/\{\{([a-z0-9_]+)\}\}/gi, (_, key) => (key in values ? String(values[key]) : ""));
 
@@ -392,9 +419,11 @@ const buildStorageBody = (sprint, groupedIssues, template) => {
 
   const sprintGoalText = String(sprint.goal || "").trim();
   const parsedGoals = splitSprintGoals(sprintGoalText);
-  const { matched: goalIssueBuckets, unmatched: unmatchedGoalIssues } = mapIssuesToGoals(parsedGoals, allIssues);
+  const effectiveGoals = parsedGoals.length > 0 ? parsedGoals : fallbackGoalsFromIssues(allIssues);
+  const { matched: goalIssueBuckets, unmatched: unmatchedGoalIssues } = mapIssuesToGoals(effectiveGoals, allIssues);
 
-  const objectiveTitle = parsedGoals[0] || sprintGoalText.split(/[.!?\n]/)[0] || "";
+  const objectiveTitle =
+    parsedGoals[0] || sprintGoalText.split(/[.!?\n]/)[0] || `Sprint objective for ${safeText(sprint.name)}`;
 
   const values = {
     sprint_number: escapeHtml(extractSprintNumber(sprint.name) || sprint.name),
@@ -431,7 +460,7 @@ const buildStorageBody = (sprint, groupedIssues, template) => {
   };
 
   for (let i = 1; i <= 5; i += 1) {
-    const goal = parsedGoals[i - 1] || "";
+    const goal = effectiveGoals[i - 1] || "";
     const goalIssues = goalIssueBuckets[i - 1] || [];
     const goalStatusItems = goalIssues.map(issueContextLine);
 
